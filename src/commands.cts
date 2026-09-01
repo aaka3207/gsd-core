@@ -2043,29 +2043,39 @@ function cmdCommit(cwd: string, message: string | undefined, files: string[] | u
     ? ['commit', '--amend', '--no-edit']
     : ['commit', '-m', sanitizedMessage as string];
   if (noVerify) commitArgs.push('--no-verify');
+  // #3859 residual: the empty-diff guard above decided whether something
+  // would land using `--ignore-submodules=dirty`, overriding the caller's
+  // `diff.ignoreSubmodules` config. The real `git commit -- <paths>` must
+  // be asked under that SAME effective submodule-diff configuration, or
+  // the two can disagree. Driven on git 2.39.5 (Debian bookworm, the Linux
+  // test-matrix image — see dockerfiles/linux.Dockerfile): with a bare
+  // `diff.ignoreSubmodules=all` repo config, `git commit -- <submodule>`
+  // silently fails (exit 1, printing only the "Changes to be committed"
+  // preview and no error text) for a gitlink bump the guard had already
+  // confirmed would be recorded. Pinned via `GIT_CONFIG_COUNT`/`_KEY_0`/
+  // `_VALUE_0` env vars — git's env-based per-invocation config override,
+  // functionally identical to `-c diff.ignoreSubmodules=dirty` — rather than
+  // an argv `-c` flag: a global `-c` must precede the `commit` subcommand,
+  // which would shift `commitArgs[0]` away from `'commit'` for every caller
+  // that keys off argv position (as tests/commit-files-pathspec.test.cjs
+  // does throughout). Scoped to exactly the branch the probe above covers
+  // (`canScope`, which the diff probe's own preconditions already imply
+  // whenever it runs) so this stays a like-for-like pairing with the probe,
+  // not a widening of the override to commits the probe never evaluated;
+  // harmless when no submodule path is involved (driven: identical commit
+  // on an ordinary scoped file, with and without it).
+  const commitEnv = canScope ? {
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'diff.ignoreSubmodules',
+    GIT_CONFIG_VALUE_0: 'dirty',
+  } : undefined;
   if (canScope) {
     commitArgs.push('--', ...stagedPaths);
-    // #3859 residual: the empty-diff guard above decided whether something
-    // would land using `--ignore-submodules=dirty`, overriding the caller's
-    // `diff.ignoreSubmodules` config. The real `git commit -- <paths>` must
-    // be asked under that SAME effective submodule-diff configuration, or
-    // the two can disagree. Driven on git 2.39.5 (Debian bookworm, the Linux
-    // test-matrix image — see dockerfiles/linux.Dockerfile): with a bare
-    // `diff.ignoreSubmodules=all` repo config, `git commit -- <submodule>`
-    // silently fails (exit 1, printing only the "Changes to be committed"
-    // preview and no error text) for a gitlink bump the guard had already
-    // confirmed would be recorded. Pinning `-c` onto the real commit — not
-    // just the probe — keeps the two calculations from ever diverging. A
-    // global `-c` must precede the `commit` subcommand, hence `unshift`
-    // rather than `push`; harmless when no submodule path is involved
-    // (driven: identical commit on an ordinary scoped file, with and
-    // without the flag).
-    commitArgs.unshift('-c', 'diff.ignoreSubmodules=dirty');
   }
   // #3886: `git commit` runs pre-commit hooks (husky/lint-staged routinely
   // idles ~4s on Windows before any task) — 10s is too tight, and a timeout
   // kill is NOT an ordinary failure. Same band as the push call below.
-  const commitResult = execGit(commitArgs, { cwd, timeout: COMMIT_TIMEOUT_MS });
+  const commitResult = execGit(commitArgs, { cwd, env: commitEnv, timeout: COMMIT_TIMEOUT_MS });
   if (commitResult.exitCode !== 0) {
     // #3886: a SIGTERM'd git commit is a timeout, not commit_failed — the
     // partial stderr it flushed (often incidental CRLF warnings) is noise,
